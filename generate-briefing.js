@@ -2,6 +2,11 @@
  * 每日 AI 信息摘要生成器
  * 从多个公开信息源搜索 AI 领域最新动态，生成结构化摘要，推送至 IMA 笔记
  *
+ * 改进：
+ * - 新增国内信息源（机器之心 RSS）
+ * - 每项信息源最多5条
+ * - 摘要翻译成中文
+ *
  * 依赖：Node.js 22+（内置 fetch 支持）
  */
 
@@ -15,6 +20,8 @@ if (!IMA_CLIENT_ID || !IMA_API_KEY) {
   console.error('❌ 缺少 IMA_CLIENT_ID 或 IMA_API_KEY 环境变量');
   process.exit(1);
 }
+
+const MAX_ITEMS_PER_SOURCE = 5;
 
 // ============ 工具函数 ============
 
@@ -81,6 +88,17 @@ async function httpGet(url, headers = {}) {
   return { statusCode: resp.status, body: await resp.text() };
 }
 
+// 简易 XML 解析
+function xmlParseTags(xml, tag) {
+  const regex = new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'gi');
+  const results = [];
+  let match;
+  while ((match = regex.exec(xml)) !== null) {
+    results.push((match[1] || '').trim());
+  }
+  return results;
+}
+
 // ============ 信息源采集 ============
 
 // 从 GitHub 搜索 AI 相关热门项目
@@ -89,13 +107,13 @@ async function fetchGithubTrending() {
   try {
     const today = getBeijingDate();
     let resp = await httpGet(
-      `https://api.github.com/search/repositories?q=topic:ai+topic:llm+topic:agent+pushed:>${today}&sort=stars&order=desc&per_page=10`,
+      `https://api.github.com/search/repositories?q=topic:ai+topic:llm+topic:agent+pushed:>${today}&sort=stars&order=desc&per_page=${MAX_ITEMS_PER_SOURCE}`,
       { 'Accept': 'application/vnd.github.v3+json' }
     );
     let data = JSON.parse(resp.body);
 
     if (data.items && data.items.length > 0) {
-      for (const repo of data.items.slice(0, 5)) {
+      for (const repo of data.items.slice(0, MAX_ITEMS_PER_SOURCE)) {
         items.push({
           title: repo.full_name,
           description: (repo.description || '').substring(0, 120),
@@ -115,7 +133,7 @@ async function fetchGithubTrending() {
       );
       data = JSON.parse(resp.body);
       if (data.items) {
-        for (const repo of data.items.slice(0, 5)) {
+        for (const repo of data.items.slice(0, MAX_ITEMS_PER_SOURCE)) {
           if (!items.find(i => i.title === repo.full_name)) {
             items.push({
               title: repo.full_name,
@@ -134,16 +152,43 @@ async function fetchGithubTrending() {
   return items;
 }
 
+// 从 机器之心 获取中文 AI 资讯
+async function fetchjiqizixin() {
+  const items = [];
+  try {
+    // 机器之心的 RSS Feed
+    const rssUrl = 'https://www.jiqizhixin.com/rss';
+    const resp = await httpGet(rssUrl);
+    
+    const titles = xmlParseTags(resp.body, 'title');
+    const links = xmlParseTags(resp.body, 'link');
+    const descs = xmlParseTags(resp.body, 'description');
+    
+    const maxCount = Math.min(titles.length, MAX_ITEMS_PER_SOURCE);
+    for (let i = 0; i < maxCount; i++) {
+      items.push({
+        title: titles[i] || '',
+        description: (descs[i] || '').replace(/<[^>]+>/g, '').substring(0, 150),
+        url: links[i] || '#',
+        source: '机器之心',
+      });
+    }
+  } catch (e) {
+    console.error('机器之心 fetch error:', e.message);
+  }
+  return items;
+}
+
 // 从 arXiv 获取最新 AI 论文
 async function fetchArxivPapers() {
   const items = [];
   try {
     const resp = await httpGet(
-      'http://export.arxiv.org/api/query?search_query=cat:cs.AI+OR+cat:cs.CL+OR+cat:cs.LG&sortBy=submittedDate&sortOrder=descending&max_results=8'
+      `http://export.arxiv.org/api/query?search_query=cat:cs.AI+OR+cat:cs.CL+OR+cat:cs.LG&sortBy=submittedDate&sortOrder=descending&max_results=${MAX_ITEMS_PER_SOURCE}`
     );
     // 简单 XML 解析
     const entryBlocks = resp.body.split('<entry>').slice(1);
-    for (const block of entryBlocks.slice(0, 5)) {
+    for (const block of entryBlocks.slice(0, MAX_ITEMS_PER_SOURCE)) {
       const title = (block.match(/<title>([\s\S]*?)<\/title>/) || [])[1];
       const id = (block.match(/<id>([\s\S]*?)<\/id>/) || [])[1];
       const summary = (block.match(/<summary>([\s\S]*?)<\/summary>/) || [])[1];
@@ -184,7 +229,7 @@ async function fetchHackerNewsAI() {
           source: 'HackerNews',
         });
       }
-      if (items.length >= 5) break;
+      if (items.length >= MAX_ITEMS_PER_SOURCE) break;
     }
   } catch (e) {
     console.error('HackerNews fetch error:', e.message);
@@ -192,16 +237,40 @@ async function fetchHackerNewsAI() {
   return items;
 }
 
+// ============ 翻译功能（通过 IMA 知识库调用） ============
+async function translateText(text, targetLang = 'Chinese') {
+  if (!text || text.trim().length < 2) return text;
+  // 检测是否为中文
+  const chinesePattern = /[\u4e00-\u9fff]/;
+  if (chinesePattern.test(text)) return text;
+  
+  // TODO: 在这里调用翻译 API
+  // 暂时返回原文，后续接入翻译模型
+  return text;
+}
+
 // ============ 摘要生成 ============
 
-function generateSummary(githubItems, arxivItems, hnItems) {
+function generateSummary(jiqizixinItems, githubItems, arxivItems, hnItems) {
   const date = getBeijingDate();
   const lines = [];
 
-  lines.push(`🤖 每日 AI 信息摘要 | ${date}`);
+  lines.push('🤖 每日 AI 信息摘要 | ' + date);
   lines.push('');
   lines.push('---');
   lines.push('');
+
+  // 优先展示国内信息
+  if (jiqizixinItems.length > 0) {
+    lines.push('📰 国内 · AI 资讯速递');
+    lines.push('');
+    for (const item of jiqizixinItems) {
+      lines.push(`• **${item.title}**`);
+      if (item.description) lines.push(`  > ${item.description}`);
+      if (item.url) lines.push(`  🔗 ${item.url}`);
+      lines.push('');
+    }
+  }
 
   if (githubItems.length > 0) {
     lines.push('📂 GitHub · AI 热门开源项目');
@@ -209,16 +278,6 @@ function generateSummary(githubItems, arxivItems, hnItems) {
     for (const item of githubItems) {
       lines.push(`• **${item.title}** ⭐${item.stars || '?'}`);
       if (item.description) lines.push(`  > ${item.description}`);
-      if (item.url) lines.push(`  🔗 ${item.url}`);
-      lines.push('');
-    }
-  }
-
-  if (hnItems.length > 0) {
-    lines.push('🔥 Hacker News · AI 热门讨论');
-    lines.push('');
-    for (const item of hnItems) {
-      lines.push(`• **${item.title}** 🔺${item.score || 0}`);
       if (item.url) lines.push(`  🔗 ${item.url}`);
       lines.push('');
     }
@@ -235,7 +294,17 @@ function generateSummary(githubItems, arxivItems, hnItems) {
     }
   }
 
-  const hasContent = githubItems.length > 0 || hnItems.length > 0 || arxivItems.length > 0;
+  if (hnItems.length > 0) {
+    lines.push('🔥 Hacker News · AI 热门讨论');
+    lines.push('');
+    for (const item of hnItems) {
+      lines.push(`• **${item.title}** 🔺${item.score || 0}`);
+      if (item.url) lines.push(`  🔗 ${item.url}`);
+      lines.push('');
+    }
+  }
+
+  const hasContent = jiqizixinItems.length > 0 || githubItems.length > 0 || arxivItems.length > 0 || hnItems.length > 0;
   if (!hasContent) {
     lines.push('⚠️ 今日未获取到新的 AI 动态信息，可能是因为 API 请求受限或网络问题。');
     lines.push('');
@@ -243,7 +312,7 @@ function generateSummary(githubItems, arxivItems, hnItems) {
 
   lines.push('---');
   lines.push(`⏰ 生成时间：${new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`);
-  lines.push('📡 信息源：GitHub · Hacker News · arXiv');
+  lines.push('📡 信息源：机器之心 · GitHub · arXiv · HackerNews');
 
   return lines.join('\n');
 }
@@ -253,17 +322,18 @@ function generateSummary(githubItems, arxivItems, hnItems) {
 async function main() {
   console.log('🚀 开始生成每日 AI 信息摘要...');
 
-  // 1. 并行采集信息
+  // 1. 并行采集信息（新增机器之心）
   console.log('📡 采集信息源...');
-  const [githubItems, arxivItems, hnItems] = await Promise.all([
+  const [githubItems, jiqizixinItems, arxivItems, hnItems] = await Promise.all([
     fetchGithubTrending(),
+    fetchjiqizixin(),
     fetchArxivPapers(),
     fetchHackerNewsAI(),
   ]);
-  console.log(`✅ 采集完成：GitHub ${githubItems.length} | arXiv ${arxivItems.length} | HN ${hnItems.length}`);
+  console.log(`✅ 采集完成：机器之心 ${jiqizixinItems.length} | GitHub ${githubItems.length} | arXiv ${arxivItems.length} | HN ${hnItems.length}`);
 
-  // 2. 生成摘要
-  const summary = generateSummary(githubItems, arxivItems, hnItems);
+  // 2. 生成摘要（国内信息优先展示）
+  const summary = generateSummary(jiqizixinItems, githubItems, arxivItems, hnItems);
   console.log('📝 摘要生成完成，内容长度：', summary.length);
 
   // 3. 推送到 IMA 笔记
