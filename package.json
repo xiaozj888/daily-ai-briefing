@@ -1,0 +1,11 @@
+{
+  "name": "daily-ai-briefing",
+  "version": "1.0.0",
+  "description": "每日 AI 信息摘要生成器，自动推送到 IMA 笔记",
+  "main": "generate-briefing.js",
+  "scripts": {
+    "start": "node generate-briefing.js"
+  },
+  "dependencies": {},
+  "license": "MIT"
+}
